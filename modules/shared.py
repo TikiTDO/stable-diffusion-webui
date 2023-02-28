@@ -141,7 +141,8 @@ ui_reorder_categories = [
     "scripts",
 ]
 
-cmd_opts.disable_extension_access = (cmd_opts.share or cmd_opts.listen or cmd_opts.server_name) and not cmd_opts.enable_insecure_extension_access
+# cmd_opts.disable_extension_access = (cmd_opts.share or cmd_opts.listen or cmd_opts.server_name) and not cmd_opts.enable_insecure_extension_access
+cmd_opts.disable_extension_access = False
 
 devices.device, devices.device_interrogate, devices.device_gfpgan, devices.device_esrgan, devices.device_codeformer = \
     (devices.cpu if any(y in cmd_opts.use_cpu for y in [x, 'all']) else devices.get_optimal_device() for x in ['sd', 'interrogate', 'gfpgan', 'esrgan', 'codeformer'])
@@ -657,6 +658,8 @@ latent_upscale_modes = {
 sd_upscalers = []
 
 sd_model = None
+
+sd_models_by_device = {}
 
 clip_model = None
 

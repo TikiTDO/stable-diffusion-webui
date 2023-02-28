@@ -156,7 +156,7 @@ def model_hash(filename):
 
 def select_checkpoint():
     model_checkpoint = shared.opts.sd_model_checkpoint
-        
+
     checkpoint_info = checkpoint_alisases.get(model_checkpoint, None)
     if checkpoint_info is not None:
         return checkpoint_info
@@ -339,7 +339,7 @@ def enable_midas_autodownload():
         if not os.path.exists(path):
             if not os.path.exists(midas_path):
                 mkdir(midas_path)
-    
+
             print(f"Downloading midas model weights for {model_type} to {path}")
             request.urlretrieve(midas_urls[model_type], path)
             print(f"{model_type} downloaded")
@@ -362,6 +362,13 @@ def repair_config(sd_config):
 
 sd1_clip_weight = 'cond_stage_model.transformer.text_model.embeddings.token_embedding.weight'
 sd2_clip_weight = 'cond_stage_model.model.transformer.resblocks.0.attn.in_proj_weight'
+
+def update_model_for_current_device():
+    device = torch.cuda.current_device()
+    if device not in shared.sd_models_by_device:
+        load_model()
+
+    shared.sd_model = shared.sd_models_by_device[device]
 
 def load_model(checkpoint_info=None, already_loaded_state_dict=None, time_taken_to_load_state_dict=None):
     from modules import lowvram, sd_hijack
@@ -424,6 +431,7 @@ def load_model(checkpoint_info=None, already_loaded_state_dict=None, time_taken_
 
     sd_model.eval()
     shared.sd_model = sd_model
+    shared.sd_models_by_device[torch.cuda.current_device()] = sd_model
 
     sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings(force_reload=True)  # Reload embeddings after model load as they may or may not fit the model
 

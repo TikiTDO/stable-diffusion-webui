@@ -367,6 +367,8 @@ class ScriptRunner:
         if script_index == 0:
             return None
 
+
+
         script = self.selectable_scripts[script_index-1]
 
         if script is None:

@@ -4,8 +4,7 @@ import torch
 from torch import nn
 from modules import devices, paths
 
-sd_vae_approx_model = None
-
+sd_vae_approx_models = {}
 
 class VAEApprox(nn.Module):
     def __init__(self):
@@ -32,15 +31,14 @@ class VAEApprox(nn.Module):
 
 
 def model():
-    global sd_vae_approx_model
 
-    if sd_vae_approx_model is None:
-        sd_vae_approx_model = VAEApprox()
-        sd_vae_approx_model.load_state_dict(torch.load(os.path.join(paths.models_path, "VAE-approx", "model.pt"), map_location='cpu' if devices.device.type != 'cuda' else None))
-        sd_vae_approx_model.eval()
-        sd_vae_approx_model.to(devices.device, devices.dtype)
+    if torch.cuda.current_device() not in sd_vae_approx_models:
+        sd_vae_approx_models[torch.cuda.current_device()] = VAEApprox()
+        sd_vae_approx_models[torch.cuda.current_device()].load_state_dict(torch.load(os.path.join(paths.models_path, "VAE-approx", "model.pt"), map_location='cpu' if devices.device.type != 'cuda' else None))
+        sd_vae_approx_models[torch.cuda.current_device()].eval()
+        sd_vae_approx_models[torch.cuda.current_device()].to(devices.device, devices.dtype)
 
-    return sd_vae_approx_model
+    return sd_vae_approx_models[torch.cuda.current_device()]
 
 
 def cheap_approximation(sample):

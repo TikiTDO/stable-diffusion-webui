@@ -3,8 +3,10 @@ import math
 import os
 import sys
 import warnings
+import traceback
 
 import torch
+import torch.multiprocessing as multiprocessing
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 import random
@@ -22,7 +24,12 @@ import modules.face_restoration
 import modules.images as images
 import modules.styles
 import modules.sd_models as sd_models
+import modules.sd_hijack as sd_hijack
 import modules.sd_vae as sd_vae
+from modules import modelloader
+import modules.codeformer_model as codeformer
+import modules.gfpgan_model as gfpgan
+
 import logging
 from ldm.data.util import AddMiDaS
 from ldm.models.diffusion.ddpm import LatentDepth2ImageDiffusion
@@ -33,6 +40,106 @@ from blendmodes.blend import blendLayers, BlendType
 # some of those options should not be changed at all because they would break the model, so I removed them from options.
 opt_C = 4
 opt_f = 8
+
+gpu_tasks = []
+gpu_count = torch.cuda.device_count()
+
+
+def init_processors():
+    # Each task will just dispatch the same parameters to it's assignedGPU
+    class GpuTask:
+        def __init__(self, gpu_id):
+            self.gpu_id = gpu_id
+            self.queue_to_processor = multiprocessing.Queue()
+            self.queue_from_processor = multiprocessing.Queue()
+            self.process = multiprocessing.Process(target=start_processor, args=(self.gpu_id, self.queue_to_processor, self.queue_from_processor))
+            self.process.start()
+            self.is_busy = False
+
+
+
+        def task(self, p):
+            self.is_busy = True
+            self.queue_to_processor.put(p)
+
+        def get_result(self):
+            result = self.queue_from_processor.get(True)
+            self.is_busy = False
+            return result
+
+        def __del__(self):
+            if self.process and self.process.is_alive():
+                self.queue_to_processor.put(None)
+                self.process.join()
+
+            gpu_tasks.remove(self)
+
+    multiprocessing.set_start_method('spawn')
+
+    for i in range(gpu_count):
+        gpu_tasks.append(GpuTask(i))
+
+def start_processor(gpu_id, input_queue: multiprocessing.Queue, output_queue: multiprocessing.Queue, override_settings: dict = {}, override_settings_restore_afterwards: dict = {}):
+    """Start the processing loop which will listen for new images requests from the input queue, and put the result images into the output queue."""
+    stored_opts = {k: opts.data[k] for k in override_settings.keys()}
+
+    with torch.cuda.device(gpu_id):
+        # sd_hijack.model_hijack.undo_hijack(shared.sd_model)
+        # sd_models.update_model_for_current_device()
+
+        modelloader.cleanup_models()
+        modules.sd_models.setup_model()
+        codeformer.setup_model(cmd_opts.codeformer_models_path)
+        gfpgan.setup_model(cmd_opts.gfpgan_models_path)
+
+        modelloader.list_builtin_upscalers()
+        modules.scripts.load_scripts()
+        modelloader.load_upscalers()
+
+        modules.sd_models.load_model()
+        sd_hijack.model_hijack.hijack(shared.sd_model)
+
+
+
+        while True:
+            p = input_queue.get(True)
+
+            print(f"Processor {gpu_id} got new task {p}\n")
+
+            if p is None:
+                break
+            else:
+                try:
+                    if p is None:
+                        break
+                    else:
+                        print("Starting processing\n")
+                        result = process_images_inner(p)
+                        print(f"Processor {gpu_id} finished processing {len(result.images)} images\n")
+                        output_queue.put(result)
+
+                except Exception as e:
+                    print(f"Exception in processor {gpu_id}: {e}\n")
+                    # Print backtrace
+                    traceback.print_tb(e.__traceback__)
+                    print(f"Sigh\n")
+
+                    output_queue.put(None)
+
+                finally:
+                    print(f"Finally\n")
+
+                    # restore opts to original state
+                    if override_settings_restore_afterwards:
+                        for k, v in stored_opts.items():
+                            setattr(opts, k, v)
+
+                            if k == 'sd_model_checkpoint':
+                                sd_models.reload_model_weights()
+
+                            if k == 'sd_vae':
+                                sd_vae.reload_vae_weights()
+
 
 
 def setup_color_correction(image):
@@ -469,35 +576,48 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments=None, iter
 
     return f"{all_prompts[index]}{negative_prompt_text}\n{generation_params_text}".strip()
 
-
 def process_images(p: StableDiffusionProcessing) -> Processed:
-    stored_opts = {k: opts.data[k] for k in p.override_settings.keys()}
+    """Dispatches the processing of the images to the GPU's and waits for the results"""
 
-    try:
-        for k, v in p.override_settings.items():
-            setattr(opts, k, v)
+    first_result = None
 
-            if k == 'sd_model_checkpoint':
-                sd_models.reload_model_weights()
+    if len(gpu_tasks ) == 0:
+        init_processors()
 
-            if k == 'sd_vae':
-                sd_vae.reload_vae_weights()
+    # Each iteration will pick a GPU, and wait for the last task on that GPU to finish before starting the next one
+    # This works best when the GPUs are identical
+    for i in range(p.n_iter):
+        task = gpu_tasks[i % gpu_count]
 
-        res = process_images_inner(p)
+        # If the task is still busy, block until it's done
+        current_result = None
+        if task.is_busy:
+            current_result = task.get_result()
+            if current_result is None:
+                # No result for some reason, so skip to next task
+                continue
+            else:
+                # Load the images into the first result
+                if first_result is None:
+                    first_result = current_result
+                else:
+                    first_result.images.extend(current_result.images)
 
-    finally:
-        # restore opts to original state
-        if p.override_settings_restore_afterwards:
-            for k, v in stored_opts.items():
-                setattr(opts, k, v)
-                if k == 'sd_model_checkpoint':
-                    sd_models.reload_model_weights()
+        # Scripts don't get pickled, so we need to set it to None before sending it to the GPU
+        p.scripts = None
+        task.task(p)
 
-                if k == 'sd_vae':
-                    sd_vae.reload_vae_weights()
+    # Now wait for all the remaining tasks to finish
+    for i in range(gpu_count):
+        task = gpu_tasks[i]
+        if task.is_busy:
+            current_result = task.get_result()
+            if first_result is None:
+                first_result = current_result
+            else:
+                first_result.images.extend(current_result.images)
 
-    return res
-
+    return first_result
 
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
@@ -572,6 +692,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         cache[0] = (required_prompts, steps)
         return cache[1]
 
+    extra_network_data = None
+
     with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
             p.init(p.all_prompts, p.all_seeds, p.all_subseeds)
@@ -580,10 +702,13 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if shared.opts.live_previews_enable and opts.show_progress_type == "Approx NN":
                 sd_vae_approx.model()
 
-        if state.job_count == -1:
-            state.job_count = p.n_iter
+        state.skipped = False
+        state.interrupted = False
 
-        for n in range(p.n_iter):
+        if state.job_count == -1:
+            state.job_count = 1
+
+        for n in [1]:
             p.iteration = n
 
             if state.skipped:
@@ -709,7 +834,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             if opts.grid_save:
                 images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(), short_filename=not opts.grid_extended_filename, p=p, grid=True)
 
-    if not p.disable_extra_networks:
+    if not p.disable_extra_networks and extra_network_data is not None:
         extra_networks.deactivate(p, extra_network_data)
 
     devices.torch_gc()

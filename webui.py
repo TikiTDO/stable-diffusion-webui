@@ -109,6 +109,11 @@ def initialize():
 
     try:
         modules.sd_models.load_model()
+
+        # with torch.cuda.device(0):
+        #     modules.sd_models.load_model()
+        # with torch.cuda.device(1):
+        #     modules.sd_models.load_model()
     except Exception as e:
         errors.display(e, "loading stable diffusion model")
         print("", file=sys.stderr)
